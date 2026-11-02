@@ -170,7 +170,7 @@ fn shell_gate(v: &Value, rules: &ClaudeHookRules) -> bool {
                 return false;
             }
             match decision::decide_for_host_unwrapped(cmd, rules, cwd) {
-                HookDecision::AllowRewrite(_) | HookDecision::AskRewrite(_, _) => {
+                HookDecision::Rewrite { .. } => {
                     let output = pre_tool_use_rewrite_output(v, &command, None);
                     let _ = writeln!(io::stdout(), "{output}");
                     audit_log("rewrite", cmd, &command);
