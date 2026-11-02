@@ -1122,55 +1122,53 @@ fn run_codex_inner(input: &str) -> Option<String> {
 /// Run the Cursor Agent hook natively.
 pub fn run_cursor() -> Result<()> {
     let input = read_stdin_limited()?;
+    let output = run_cursor_inner_impl(&input, |cmd| {
+        decide_hook_action(cmd, permissions::Host::Cursor, None)
+    });
+    let _ = writeln!(io::stdout(), "{output}");
+    Ok(())
+}
 
-    let input = strip_leading_bom(&input).trim();
+/// Parse the Cursor payload, decide, and render the reply: `{}` (no opinion)
+/// for anything RTK does not rewrite, including a payload it cannot read.
+/// `run_cursor` and the tests share it, so the tests exercise the parsing and
+/// rendering that ship; only the decision is passed in.
+fn run_cursor_inner_impl(input: &str, decide: impl Fn(&str) -> HookDecision) -> String {
+    let input = strip_leading_bom(input).trim();
     if input.is_empty() {
-        let _ = writeln!(io::stdout(), "{{}}");
-        return Ok(());
+        return "{}".to_string();
     }
-
-    let v: Value = match serde_json::from_str(input) {
-        Ok(v) => v,
-        Err(_) => {
-            let _ = writeln!(io::stdout(), "{{}}");
-            return Ok(());
-        }
+    let Ok(v) = serde_json::from_str::<Value>(input) else {
+        return "{}".to_string();
     };
-
-    let cmd = match v
+    let Some(cmd) = v
         .pointer("/tool_input/command")
         .and_then(|c| c.as_str())
         .filter(|c| !c.is_empty())
-    {
-        Some(c) => c.to_string(),
-        None => {
-            let _ = writeln!(io::stdout(), "{{}}");
-            return Ok(());
-        }
+    else {
+        return "{}".to_string();
     };
 
-    let output = match decide_hook_action(&cmd, permissions::Host::Cursor, None) {
+    match decide(cmd) {
         HookDecision::Rewrite {
             command: rewritten,
             approval,
         } => {
             if approval.is_allow() {
-                audit_log("rewrite", &cmd, &rewritten);
+                audit_log("rewrite", cmd, &rewritten);
                 cursor_allow(&rewritten)
             } else {
-                audit_log("ask", &cmd, &rewritten);
+                audit_log("ask", cmd, &rewritten);
                 cursor_ask(&rewritten)
             }
         }
         other => {
             if matches!(other, HookDecision::Deny) {
-                audit_log("deny", &cmd, "");
+                audit_log("deny", cmd, "");
             }
             "{}".to_string()
         }
-    };
-    let _ = writeln!(io::stdout(), "{output}");
-    Ok(())
+    }
 }
 
 fn cursor_allow(rewritten: &str) -> String {
@@ -1203,40 +1201,13 @@ fn run_cursor_inner_with_rules(
     ask_rules: &[String],
     allow_rules: &[String],
 ) -> String {
-    let input = strip_leading_bom(input);
-    let v: Value = match serde_json::from_str(input) {
-        Ok(v) => v,
-        Err(_) => return "{}".to_string(),
-    };
-
-    let cmd = match v
-        .pointer("/tool_input/command")
-        .and_then(|c| c.as_str())
-        .filter(|c| !c.is_empty())
-    {
-        Some(c) => c.to_string(),
-        None => return "{}".to_string(),
-    };
-
     let rules = permissions::HostRules::lists(
         permissions::Host::Cursor,
         deny_rules,
         ask_rules,
         allow_rules,
     );
-    match decide_with_host_rules(&cmd, &rules, None) {
-        HookDecision::Rewrite {
-            command: rewritten,
-            approval,
-        } => {
-            if approval.is_allow() {
-                cursor_allow(&rewritten)
-            } else {
-                cursor_ask(&rewritten)
-            }
-        }
-        _ => "{}".to_string(),
-    }
+    run_cursor_inner_impl(input, |cmd| decide_with_host_rules(cmd, &rules, None))
 }
 
 // ── Factory Droid PreToolUse hook ──────────────────────────────
@@ -3252,24 +3223,15 @@ mod tests {
 
     // --- Gemini rendering ---
 
+    /// The Gemini hook's reply to `cmd` under these rules, through the same
+    /// parse and render path as `run_gemini`.
     fn gemini_render(cmd: &str, deny: &[String], ask: &[String], allow: &[String]) -> String {
-        match decide_with_rules(cmd, deny, ask, allow) {
-            HookDecision::Deny => {
-                r#"{"decision":"deny","reason":"Blocked by RTK permission rule"}"#.to_string()
-            }
-            HookDecision::Rewrite {
-                command: r,
-                approval,
-            } => {
-                let decision = if approval.is_allow() {
-                    "allow"
-                } else {
-                    "ask_user"
-                };
-                gemini_json(decision, Some(&r))
-            }
-            HookDecision::Defer => gemini_json("ask_user", None),
-        }
+        let payload = json!({
+            "tool_name": "run_shell_command",
+            "tool_input": { "command": cmd }
+        });
+        run_gemini_inner_with_rules(&payload.to_string(), deny, ask, allow)
+            .expect("the payload is valid JSON")
     }
 
     #[test]
